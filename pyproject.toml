@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synapse"
+version = "0.1"
+description = "SYnergistic iNfluence of Adaptive coupling Points in multi-energy System intEgration"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.7"
+license = "MIT"
+authors = [
+  { name = "Rico Schrage", email = "rico.schrage@uni-oldenburg.de" }
+]
+# urls = { Homepage = "https://github.com/me/myproject" }
+
+classifiers = [
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy"
+]
+
+dependencies = [
+  "pandas",
+  "numpy",
+  "pandapipes==0.12.0",
+  "pandapower==3.2.1",
+  "mango-agents==0.3.0",
+  "mango-library",
+  "pytest",
+  "peext",
+  "overrides",
+  "networkx",
+  "jax[cpu]",
+  "simbench==1.6.1",
+  "scipy",
+  "plotly==5.11.0",
+  "kaleido==0.2.1",
+  "python-interface"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "twine",
+]
+
+[tool.setuptools]
+include-package-data = true
