@@ -1,36 +1,56 @@
-import peext.scenario.network as ps
-import pandapipes
+"""Integration tests for the monee MES builder and the mango DAT simulation.
 
-import pandapipes.multinet.control as ppmc
-import synapse.simulation.profiles as ssp
+These build a small simbench multi-energy network (requires the ``simbench``
+extra) and, for the full-simulation test, solve it with gurobi.
+"""
 
+import pytest
 
-def test_multinet_pickle_json():
-    feature_rich_mn = ps.create_medium_multinet_gas_power()
+from synapse.agent.world import build_agent_topology, child_aid
+from synapse.mes.network import create_mes_from_simbench_with_cp_distribution
 
-    pandapipes.to_json(feature_rich_mn, "network.p")
-
-
-def test_load_net():
-    mn = None
-    # mn = pandapipes.from_pickle("data/dat/2022-09-09+14-29-42.134264/1-MV-urban--1-no_sw_1_1/AdaptionRateExperiment-MES/Param-0.5-SplittingStrategy.DISINTEGRATE/network.p")
-    print(mn)
+SMALL_GRID = "1-LV-rural3--1-no_sw"
 
 
-def test_tt():
-
-    grid_code = "1-LV-rural1--0-no_sw"
-
-    mn = ps.generate_multi_network_based_on_simbench(
-        grid_code,
-        heat_deployment_rate=1,
-        gas_deployment_rate=0.5,
-        chp_density=0.7,
-        p2g_density=0.5,
-        p2h_density=0.7,
+@pytest.fixture(scope="module")
+def small_mes():
+    return create_mes_from_simbench_with_cp_distribution(
+        SMALL_GRID,
+        heat_deployment_rate=0.3,
+        gas_deployment_rate=0.3,
+        chp_density=0.3,
+        p2g_density=0.2,
+        p2h_density=0.2,
+        seed=100,
     )
-    import pandapipes as pp
 
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
 
-    print("asda")
+def test_build_mes_has_grids_and_coupling_points(small_mes):
+    grids = {type(n.grid).__name__ for n in small_mes.nodes}
+    assert any("Power" in g for g in grids)
+    assert any("Gas" in g for g in grids)
+    assert any("Water" in g for g in grids)
+
+    cp_names = {"PowerToGas", "GasToPower", "PowerToHeat", "PowerToHeatHG"}
+    cps = [b for b in small_mes.branches if type(b.model).__name__ in cp_names]
+    assert len(cps) > 0
+
+
+def test_agent_topology_has_child_and_cp_vertices(small_mes):
+    graph, child_specs, cp_specs = build_agent_topology(small_mes)
+    assert len(child_specs) > 0
+    # Every child has a vertex in the agent topology.
+    for aid, child in child_specs:
+        assert graph.has_node(aid)
+        assert aid == child_aid(child.id)
+    # Coupling points become their own agent vertices.
+    assert len(cp_specs) >= 0
+
+
+@pytest.mark.integration
+def test_dat_simulation_forms_regions(small_mes):
+    from synapse.simulation.scenarios import start_dat_simulation
+
+    world, behavior = start_dat_simulation(small_mes, time_steps=3)
+    assert behavior.net_results is not None
+    assert behavior.region_manager.region_count >= 1

@@ -7,7 +7,7 @@ name = "synapse"
 version = "0.1"
 description = "SYnergistic iNfluence of Adaptive coupling Points in multi-energy System intEgration"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
   { name = "Rico Schrage", email = "rico.schrage@uni-oldenburg.de" }
@@ -17,35 +17,46 @@ authors = [
 classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.7",
-  "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: PyPy"
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: Implementation :: CPython"
 ]
 
+# NOTE: the physical engine is now monee (local checkout) and agents run on the
+# local mango 2.x stack -- the same local variants scare depends on. The old
+# peext / pandapower / pandapipes / mango-agents==0.3.0 / mango-library deps are
+# gone. ``monee[simbench]`` still pulls pandapower+simbench *transitively*, but
+# only inside ``monee.io.from_simbench`` -- synapse no longer imports any of them
+# directly.
 dependencies = [
   "pandas",
   "numpy",
-  "pandapipes==0.12.0",
-  "pandapower==3.2.1",
-  "mango-agents==0.3.0",
-  "mango-library",
-  "pytest",
-  "peext",
-  "overrides",
   "networkx",
-  "jax[cpu]",
-  "simbench==1.6.1",
   "scipy",
-  "plotly==5.11.0",
-  "kaleido==0.2.1",
-  "python-interface"
+  "overrides",
+  "monee[simbench] @ file:///home/rschrage/git/monee",
+  "mango-agents @ file:///home/rschrage/git/mango",
+  "plotly>=5.0",
+  "kaleido",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest",
+  "pytest-asyncio",
   "twine",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["test"]
+markers = [
+    "integration: end-to-end tests that solve the network (require gurobi)",
 ]
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]

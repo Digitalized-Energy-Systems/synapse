@@ -1,21 +1,30 @@
-# dynamic structure in adaptive network-topologies
+"""Dynamic Adaptive Topology (DAT) roles, ported to mango 2.x + monee.
 
-from abc import ABC
+A coupling point periodically toggles itself on/off; when it switches off it is
+cut out of the agent topology and its region is split according to the chosen
+:class:`SplittingStrategy`.  The physical on/off is applied through monee via the
+behavior's ``regulate`` action.
+"""
+
+from __future__ import annotations
+
+import random
 from dataclasses import dataclass
 from enum import Enum
-import random
 from typing import List
 
+import networkx as nx
 from overrides import overrides
 
-import networkx as nx
-
 from synapse.agent.cell_agent import CellAgentRole
-from synapse.agent.core import SecmesAgentRouter, SecmesRegionManager, SyncAgentRole
+from synapse.agent.core import SecmesRegionManager, SynapseAgentGraph, SynapseRole
+
+CP_TOGGLE_PERIOD_S = 1.0
 
 
 @dataclass
 class RegionDisbandedMessage:
+    sender_aid: str
     region_id: int
     time: int
 
@@ -25,59 +34,50 @@ class SplittingStrategy(Enum):
     DISINTEGRATE = 2
 
 
-def execute_splitting_strategy(
+async def execute_splitting_strategy(
+    role: SynapseRole,
     strategy: SplittingStrategy,
-    router: SecmesAgentRouter,
+    graph: SynapseAgentGraph,
     region_manager: SecmesRegionManager,
     cp_aid: str,
     networks: List[str],
     time: int,
 ):
+    region = region_manager.get_agent_region(cp_aid)
+    if region is None:
+        graph.unlink_cp(cp_aid)
+        return
+    agents_in_own_region = set(region_manager.get_agents_region(region))
+    agents_in_own_region.discard(cp_aid)
+
     if strategy == SplittingStrategy.DISINTEGRATE:
-        # The region will be closed to avoid not optimal region
-        # structures.
-        region = region_manager.get_agent_region(cp_aid)
-        agents_in_own_region = region_manager.get_agents_region(region)
-        agents_in_own_region.remove(cp_aid)
-
-        # shut down CP, remove region, remove self from agent
-        # topology
-        router.unlink_cp(cp_aid, network_names=networks)
-        agents_as_subgraph = router.get_agents_as_subgraph(agents_in_own_region)
-
-        # It is possible that the region is still a connected component
-        if len(list(nx.connected_components(agents_as_subgraph))) == 1:
+        graph.unlink_cp(cp_aid)
+        subgraph = graph.get_agents_as_subgraph(list(agents_in_own_region))
+        if len(list(nx.connected_components(subgraph))) <= 1:
             region_manager.remove_assigned_agent(cp_aid, region)
         else:
             region_manager.remove_region(region)
-
-            # All agents will be notified
-            # to give them a chance to join another region asap
             for aid in agents_in_own_region:
-                router.dispatch_message_sync(
-                    RegionDisbandedMessage(region, time), aid, cp_aid
-                )
-    else:
-        region = region_manager.get_agent_region(cp_aid)
-        agents_in_own_region = region_manager.get_agents_region(region)
-        agents_in_own_region.remove(cp_aid)
-
+                await role.send(aid, RegionDisbandedMessage(cp_aid, region, time))
+    else:  # CONNECTED_COMPONENTS
         region_manager.remove_region(region)
-        router.unlink_cp(cp_aid, network_names=networks)
-
-        agents_as_subgraph = router.get_agents_as_subgraph(agents_in_own_region)
-
-        for component in nx.connected_components(agents_as_subgraph):
+        graph.unlink_cp(cp_aid)
+        subgraph = graph.get_agents_as_subgraph(list(agents_in_own_region))
+        for component in nx.connected_components(subgraph):
             neighbor_regions = set()
             for node in component:
-                for neighbor in router.lookup_direct_neighbors(node):
-                    neighbor_region = region_manager.get_agent_region(neighbor)
-                    if neighbor_region is not None:
-                        neighbor_regions |= {neighbor_region}
+                for neighbor in graph.lookup_direct_neighbors(node):
+                    nr = region_manager.get_agent_region(neighbor)
+                    if nr is not None:
+                        neighbor_regions |= {nr}
             region_manager.add_region(neighbor_regions, component)
 
 
-class DynamicCoalitionAdaptionTopologyAgent(CellAgentRole, ABC):
+class DynamicCoalitionAdaptionTopologyAgent(CellAgentRole):
+    """A :class:`CellAgentRole` that reacts to region disbanding and does not
+    self-adjust its operation point (topology adaption is the driver here)."""
+
+    @overrides
     def setup(self):
         super().setup()
         self.context.subscribe_message(
@@ -86,48 +86,64 @@ class DynamicCoalitionAdaptionTopologyAgent(CellAgentRole, ABC):
             lambda c, _: isinstance(c, RegionDisbandedMessage),
         )
 
-    def handle_region_disbanded(self, msg, _):
-        self.control(msg.time)
+    def handle_region_disbanded(self, msg: RegionDisbandedMessage, _meta):
+        # Re-bootstrap a region for this agent on the next opportunity.
+        self.create_initial_region()
 
     @overrides
     def execute_operation_point(self, time):
-        # no operation point adjustment here
+        # No operation-point adjustment in the DAT scenario.
         pass
 
 
-class DATCouplingPointRole(SyncAgentRole):
+class DATCouplingPointRole(SynapseRole):
+    """Periodically toggles a coupling point, splitting its region when it goes
+    offline and re-forming one when it comes back."""
+
     def __init__(
         self,
-        nc,
-        probablity: float,
+        behavior,
+        cp_aid_networks,
+        probability: float,
         splitting_strategy: SplittingStrategy = SplittingStrategy.DISINTEGRATE,
     ) -> None:
-        self._local_model = nc
+        super().__init__(behavior)
+        self._networks = cp_aid_networks
         self._toggle = True
-        self._probability = probablity
+        self._probability = probability
         self._splitting_strategy = splitting_strategy
+        self._round = 0
 
-    def control(self, time):
-        if time > 2:
-            region_m: SecmesRegionManager = self.region_manager
-            router: SecmesAgentRouter = self.router
+    def setup(self):
+        self.context.schedule_periodic_task(self._toggle_round, CP_TOGGLE_PERIOD_S)
 
-            if random.random() < self._probability:
-                self._toggle = not self._toggle
-                if self._toggle:
-                    # Switch model on again
-                    self._local_model.regulate(1)
-                    router.link_cp(self.context.aid)
-                    region_m.register_region(set(), self.context.aid)
-                else:
-                    # shut down physical
-                    self._local_model.regulate(0)
-                    # execute splitting strategy
-                    execute_splitting_strategy(
-                        self._splitting_strategy,
-                        router,
-                        region_m,
-                        self.context.aid,
-                        self._local_model.networks,
-                        time,
-                    )
+    async def _toggle_round(self):
+        time = self._round
+        self._round += 1
+        if time <= 2:
+            return
+        if random.random() >= self._probability:
+            return
+
+        region_m: SecmesRegionManager = self.region_manager
+        graph: SynapseAgentGraph = self.graph
+        self._toggle = not self._toggle
+        if self._toggle:
+            # Switch the coupling point back on.
+            if self.behavior.has_action(self.aid, "regulate"):
+                self.behavior.act(self.aid, "regulate", 1.0)
+            graph.link_cp(self.aid)
+            region_m.register_region(set(), self.aid)
+        else:
+            # Shut it down physically and split its region.
+            if self.behavior.has_action(self.aid, "regulate"):
+                self.behavior.act(self.aid, "regulate", 0.0)
+            await execute_splitting_strategy(
+                self,
+                self._splitting_strategy,
+                graph,
+                region_m,
+                self.aid,
+                self._networks,
+                time,
+            )

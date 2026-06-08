@@ -1,254 +1,79 @@
-import peext.scenario.network as pn
-import pandapipes.multinet.control as ppmc
+"""Fast, solver-free unit tests for the coalition primitives."""
 
-from peext.node import (
-    PowerLoadNode,
-    GeneratorNode,
-    HeatExchangerNode,
-    SourceNode,
-    CHPNode,
-    P2GNode,
-)
-from mango.role.core import RoleAgentContext, RoleHandler
-import numpy as np
-
-from synapse.agent.cell_agent import (
-    CellAgentRole,
-    GasCA,
-    HeatCA,
-    PowerCA,
-    PowerGasCA,
-    PowerGasHeatCA,
-)
-
-from synapse.agent.core import SecmesRegionManager
-from synapse.agent.core import SecmesAgentRouter
+from types import SimpleNamespace
 
 import networkx as nx
+import numpy as np
+
+from synapse.agent.cell_agent import CellAgentRole, to_multi_energy
+from synapse.agent.core import SecmesRegionManager, SynapseAgentGraph
 
 
-def test_attraction_id_load():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    load_model = PowerLoadNode(0, mn["nets"]["power"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    load_cell_agent = CellAgentRole(load_model, PowerCA(load_model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    load_cell_agent.secmes_setup(region_manager=region_m, sync_router=None)
-    load_cell_agent.bind(RoleAgentContext(None, None, 0, None, None))
+class _StubBehavior:
+    def __init__(self, region_manager, agent_graph):
+        self.region_manager = region_manager
+        self.agent_graph = agent_graph
+        self.aid_to_addr = {}
 
-    # WHEN
-    attraction = load_cell_agent.calc_agent_attraction(0, np.array([-200, 0, 0]))
+    def address_of(self, aid):
+        return self.aid_to_addr.get(aid)
 
-    # THEN
-    assert (attraction <= 0).all()
+    def observe(self, aid):
+        return {}
+
+    def has_action(self, aid, action):
+        return False
 
 
-def test_attraction_id_generator():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    generator_model = GeneratorNode(0, mn["nets"]["power"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    generator_agent = CellAgentRole(generator_model, PowerCA(generator_model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    generator_agent.secmes_setup(region_manager=region_m, sync_router=None)
-    generator_agent.bind(RoleAgentContext(None, None, 0, None, None))
+class _ConstCA:
+    def __init__(self, balance):
+        self._balance = np.array(balance, dtype=float)
 
-    # WHEN
-    attraction = generator_agent.calc_agent_attraction(0, np.array([200, 0, 0]))
+    def calc_balance(self):
+        return self._balance
 
-    # THEN
-    assert (attraction <= 0).all()
+    def max_energy(self):
+        return np.abs(self._balance)
 
 
-def test_attraction_generator_load():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    generator_model = GeneratorNode(0, mn["nets"]["power"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    generator_agent = CellAgentRole(generator_model, PowerCA(generator_model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    generator_agent.secmes_setup(region_manager=region_m, sync_router=None)
-    generator_agent.bind(RoleAgentContext(None, None, 0, None, None))
+def _make_agent(own_balance, aid="self"):
+    rm = SecmesRegionManager()
+    graph = SynapseAgentGraph(nx.Graph())
+    behavior = _StubBehavior(rm, graph)
+    agent = CellAgentRole(behavior, _ConstCA(own_balance))
+    # Bind a minimal context so ``agent.aid`` resolves without a mango container.
+    agent._context = SimpleNamespace(aid=aid)
+    return agent, rm
 
-    # WHEN
-    attraction = generator_agent.calc_agent_attraction(0, np.array([-200, 0, 0]))
 
-    # THEN
+def test_region_manager_register_and_merge():
+    rm = SecmesRegionManager()
+    r0 = rm.register_region(set(), "a")
+    rm.register_region(set(), "b")
+    assert rm.region_count == 2
+    rm.register_agent("b", r0)  # move b into a's region
+    assert rm.get_agent_region("a") == r0
+    assert rm.get_agent_region("b") == r0
+    assert rm.region_count == 1  # b's old (now empty) region removed
+
+
+def test_attraction_surplus_attracts_deficit():
+    # An agent with a power deficit is attracted to a neighbour with surplus.
+    agent, _ = _make_agent(own_balance=[-200, 0, 0])
+    agent._peer_balance["other"] = to_multi_energy(power=200)
+    attraction = agent.calc_agent_attraction("other", np.array([-200.0, 0, 0]))
     assert (attraction >= 0).all()
 
 
-def test_attraction_generator_load_small():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    generator_model = GeneratorNode(0, mn["nets"]["power"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    generator_agent = CellAgentRole(generator_model, PowerCA(generator_model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    generator_agent.secmes_setup(region_manager=region_m, sync_router=None)
-    generator_agent.bind(RoleAgentContext(None, None, 0, None, None))
-
-    # WHEN
-    attraction = generator_agent.calc_agent_attraction(0, np.array([-0.0001, 0, 0]))
-
-    # THEN
-    assert (attraction >= 0).all()
-
-
-def test_attraction_heat_exchanger_id():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    he_model = HeatExchangerNode(0, mn["nets"]["heat"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    he_agent = CellAgentRole(he_model, HeatCA(he_model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    he_agent.secmes_setup(region_manager=region_m, sync_router=None)
-    he_agent.bind(RoleAgentContext(None, None, 0, None, None))
-
-    # WHEN
-    attraction = he_agent.calc_agent_attraction(0, np.array([0, -20, 0]))
-
-    # THEN
+def test_attraction_same_sign_repels():
+    agent, _ = _make_agent(own_balance=[200, 0, 0])
+    agent._peer_balance["other"] = to_multi_energy(power=200)
+    attraction = agent.calc_agent_attraction("other", np.array([200.0, 0, 0]))
     assert (attraction <= 0).all()
 
 
-def test_attraction_heat_exchanger_diff():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    he_model = HeatExchangerNode(0, mn["nets"]["heat"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    he_agent = CellAgentRole(he_model, HeatCA(he_model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    he_agent.secmes_setup(region_manager=region_m, sync_router=None)
-    he_agent.bind(RoleAgentContext(None, None, 0, None, None))
-
-    # WHEN
-    attraction = he_agent.calc_agent_attraction(0, np.array([0, 20, 0]))
-
-    # THEN
-    assert (attraction >= 0).all()
-
-
-def test_attraction_gas_id():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    model = SourceNode(0, mn["nets"]["gas"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    agent = CellAgentRole(model, GasCA(model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    agent.secmes_setup(region_manager=region_m, sync_router=None)
-    agent.bind(RoleAgentContext(None, None, 0, None, None))
-
-    # WHEN
-    attraction = agent.calc_agent_attraction(0, np.array([0, 0, 20]))
-
-    # THEN
-    assert (attraction <= 0).all()
-
-
-def test_attraction_gas_diff():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    model = SourceNode(0, mn["nets"]["gas"])
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    agent = CellAgentRole(model, GasCA(model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    agent.secmes_setup(region_manager=region_m, sync_router=None)
-    agent.bind(RoleAgentContext(None, None, 0, None, None))
-
-    # WHEN
-    attraction = agent.calc_agent_attraction(0, np.array([0, 0, -20]))
-
-    # THEN
-    assert (attraction >= 0).all()
-
-
-def test_attraction_chp_full_diff():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    model = CHPNode(0, mn)
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    agent = CellAgentRole(model, GasCA(model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    agent.secmes_setup(region_manager=region_m, sync_router=None)
-    agent.bind(RoleAgentContext(None, None, 0, None, None))
-
-    # WHEN
-    attraction = agent.calc_agent_attraction(0, np.array([-10, -10, 10]))
-
-    # THEN
-    assert (attraction >= 0).all()
-
-
-def test_attraction_chp_same_cases():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    model = CHPNode(0, mn)
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    agent = CellAgentRole(model, GasCA(model))
-    region_m = SecmesRegionManager()
-    region_m.register_region([], 0)
-    agent.secmes_setup(region_manager=region_m, sync_router=None)
-    agent.bind(RoleAgentContext(None, None, 0, None, None))
-
-    # WHEN
-    attraction = agent.calc_agent_attraction(0, np.array([10, 10, -10]))
-    attraction2 = agent.calc_agent_attraction(0, np.array([0, 10, 0]))
-    attraction3 = agent.calc_agent_attraction(0, np.array([10, 0, 0]))
-    attraction4 = agent.calc_agent_attraction(0, np.array([0, 0, -10]))
-
-    # THEN
-    assert (attraction <= 0).all()
-    assert (attraction2 <= 0).all()
-    assert (attraction3 <= 0).all()
-    assert (attraction4 <= 0).all()
-
-
-def test_mes_real_case():
-    # GIVEN
-    mn = pn.create_small_test_multinet()
-    ppmc.run_control_multinet.run_control(mn, max_iter=30, mode="all")
-    model_chp = CHPNode(0, mn)
-    model_p2g = P2GNode(1, mn)
-    model_heat = HeatExchangerNode(0, mn["nets"]["heat"])
-
-    agent_chp = CellAgentRole(model_chp, PowerGasHeatCA(model_chp))
-    agent_p2g = CellAgentRole(model_p2g, PowerGasCA(model_p2g))
-    agent_heat = CellAgentRole(model_heat, HeatCA(model_heat))
-
-    topology = nx.Graph()
-    topology.add_node("chp", agent=agent_chp)
-    topology.add_node("p2g", agent=agent_p2g)
-    topology.add_node("heat", agent=agent_heat)
-    topology.add_edge("chp", "p2g")
-    topology.add_edge("heat", "p2g")
-    router = SecmesAgentRouter(topology)
-    region_m = SecmesRegionManager()
-    big_region = region_m.register_region([], "p2g")
-    region_m.register_agent("heat", big_region)
-    region_m.register_region([], "chp")
-
-    agent_chp.bind(RoleAgentContext(None, RoleHandler(None, None), "chp", None, None))
-    agent_p2g.bind(RoleAgentContext(None, RoleHandler(None, None), "p2g", None, None))
-    agent_heat.bind(RoleAgentContext(None, RoleHandler(None, None), "heat", None, None))
-    agent_chp.secmes_setup(region_manager=region_m, sync_router=router)
-    agent_p2g.secmes_setup(region_manager=region_m, sync_router=router)
-    agent_heat.secmes_setup(region_manager=region_m, sync_router=router)
-    agent_chp.setup()
-    agent_p2g.setup()
-    agent_heat.setup()
-
-    # WHEN
-    attraction = agent_chp.calc_agent_attraction("p2g", np.array([10, 10, -10]))
-
-    # THEN
-    assert (attraction > 0).all()
+def test_region_balance_sums_cached_peers():
+    agent, rm = _make_agent(own_balance=[5, 0, 0], aid="self")
+    agent._peer_balance["p1"] = to_multi_energy(power=3)
+    total = agent.calc_region_balance({"self", "p1"})
+    assert np.isclose(total[0], 8.0)

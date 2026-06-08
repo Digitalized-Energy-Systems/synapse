@@ -6,13 +6,28 @@
 #
 
 import numpy as np
-from jax import grad
 
 def iteration_step(w, x, f_grad, m, i, k):
     return np.sum([w[i][j]*x[j] - 1/(k+1) * f_grad(x[i]) for j in range(m)], axis=0)
 
-def grad_f(f):
-    return grad(f)
+def grad_f(f, eps=1e-6):
+    """Central finite-difference gradient of ``f`` (jax-free).
+
+    Works for scalar and vector inputs, so it can replace the former
+    ``jax.grad`` without the heavyweight dependency.
+    """
+    def g(x):
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 0:
+            return (f(x + eps) - f(x - eps)) / (2 * eps)
+        grad = np.zeros_like(x)
+        for k in range(x.size):
+            dx = np.zeros_like(x)
+            dx.flat[k] = eps
+            grad.flat[k] = (f(x + dx) - f(x - dx)) / (2 * eps)
+        return grad
+
+    return g
 
 def generate_linear_desc_array(n):
     return np.arange(1, 0, step=-1/n)

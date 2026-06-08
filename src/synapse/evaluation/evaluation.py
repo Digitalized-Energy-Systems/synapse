@@ -10,25 +10,25 @@ pio.kaleido.scope.mathjax = None
 pio.templates["publish"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=19),
-        titlefont=dict(family="sans-serif", size=19),
+        title=dict(font=dict(family="sans-serif", size=19)),
     )
 )
 pio.templates["publish3"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=19),
-        titlefont=dict(family="sans-serif", size=19),
+        title=dict(font=dict(family="sans-serif", size=19)),
     )
 )
 pio.templates["publish2"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=13),
-        titlefont=dict(family="sans-serif", size=13),
+        title=dict(font=dict(family="sans-serif", size=13)),
     )
 )
 pio.templates["publish1"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=9),
-        titlefont=dict(family="sans-serif", size=9),
+        title=dict(font=dict(family="sans-serif", size=9)),
     )
 )
 

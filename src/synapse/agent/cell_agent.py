@@ -1,553 +1,345 @@
-# jeder agent registriert sich eine zelle
-# agent prüft alle nachbarn
-# auf eine vereinigungsscore, score hoch genug -> vereinigen, sonst -> nix
-# bei vereinigung degregistrierung der alten zelle und registrierung einer neuen
-# regulation entsprechend der region balance
-# wird in einem iterativen PID verfahren erledigt (Dynamik ist hier gegeben durch die Agenten, nicht das Netz!)
-# Spannung/Druck: ?
+"""Cell agents for coalition formation, ported to mango 2.x + monee.
+
+The coalition-formation algorithm (attraction-based region joining + a local
+distributed-gradient operation point) is preserved, but the former *synchronous*
+in-process round-trips are replaced by genuine mango message passing.  Because a
+blocking ``await reply`` would not advance the discrete-event clock, the protocol
+is gossip / event driven: agents publish their balance to neighbors, cache what
+they hear, and act each control round on the cached view (which converges over
+rounds).  Physical quantities are read from monee via ``behavior.observe(aid)``.
+"""
+
+from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
-from synapse.agent.core import SecmesAgentRouter, SecmesRegionManager, SyncAgentRole
+from synapse.agent.core import SecmesRegionManager, SynapseAgentGraph, SynapseRole
 from synapse.da.dgd import (
-    generate_linear_desc_array,
     generate_random_doubly_stoch_mat,
     iteration_step,
 )
 
-import peext.network as pn
-from peext.node import (
-    RegulatableMESModel,
-    PowerLoadNode,
-    P2GNode,
-    P2HNode,
-    CHPNode,
-    G2PNode,
-    SinkNode,
-    CouplingPoint,
-)
+CONTROL_PERIOD_S = 1.0
 
 
+# --------------------------------------------------------------------- messages
 @dataclass
-class AgentBalanceSumRequest:
-    pass
-
-
-@dataclass
-class RegionBalanceSumRequest:
-    pass
+class AgentBalanceAnnounce:
+    sender_aid: str
+    balance: list
 
 
 @dataclass
 class JoinRequest:
+    sender_aid: str
     region_id: int
-    region_attraction: int
+    region_attraction: list
 
 
-@dataclass
-class AgentBalanceSumAnswer:
-    sum: float
+# --------------------------------------------------------- component access layer
+def to_multi_energy(power=0.0, heat=0.0, gas=0.0):
+    return np.array([float(power), float(heat), float(gas)])
 
 
-@dataclass
-class RegionBalanceSumAnswer:
-    sum: float
+def _f(obs, key, default=0.0):
+    val = obs.get(key, default)
+    if hasattr(val, "value"):
+        val = val.value
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
 
 
-@dataclass
-class CalcOperationPointIteration:
-    time: int
-    w: object
-    alpha: object
-    x: object
+class CommonNetworkComponentAccess(ABC):
+    """Reads a component's multi-energy balance / capability from monee results.
+
+    Balance uses the *injection* convention (positive = surplus into the grid):
+    monee stores demands in load convention (load/sink/heat-load positive), so
+    the injection balance is simply the negated observed setpoint.
+    """
+
+    def __init__(self, behavior, aid) -> None:
+        self._behavior = behavior
+        self._aid = aid
+
+    def _obs(self):
+        return self._behavior.observe(self._aid)
+
+    @abstractmethod
+    def calc_balance(self):
+        ...
+
+    @abstractmethod
+    def max_energy(self):
+        ...
+
+    def define_local_constraints(self):
+        return lambda r: None
 
 
-INVERT_POWER_BALANCE_RATE = {PowerLoadNode, P2GNode, P2HNode}
-INVERT_GAS_BALANCE_RATE = {CHPNode, G2PNode, SinkNode}
+class PowerCA(CommonNetworkComponentAccess):
+    def calc_balance(self):
+        obs = self._obs()
+        return to_multi_energy(power=-_f(obs, "p_mw"))
+
+    def max_energy(self):
+        return to_multi_energy(power=abs(_f(self._obs(), "p_mw")))
 
 
-class CellAgentRole(SyncAgentRole, ABC):
-    def __init__(self, network_component, common_nc_data_access) -> None:
-        super().__init__()
+class GasCA(CommonNetworkComponentAccess):
+    def calc_balance(self):
+        obs = self._obs()
+        return to_multi_energy(gas=-_f(obs, "mass_flow"))
 
-        self._local_model = network_component
-        self._common_nc_data_access = common_nc_data_access
-        self._environment_perceptions = {}
+    def max_energy(self):
+        return to_multi_energy(gas=abs(_f(self._obs(), "mass_flow")))
+
+
+class HeatCA(CommonNetworkComponentAccess):
+    def calc_balance(self):
+        obs = self._obs()
+        return to_multi_energy(heat=-_f(obs, "q_mw_heat"))
+
+    def max_energy(self):
+        return to_multi_energy(heat=abs(_f(self._obs(), "q_mw_heat")))
+
+
+class DummyHeatCA(CommonNetworkComponentAccess):
+    def calc_balance(self):
+        return to_multi_energy()
+
+    def max_energy(self):
+        return to_multi_energy()
+
+
+class PowerGasCA(CommonNetworkComponentAccess):
+    def calc_balance(self):
+        obs = self._obs()
+        return to_multi_energy(power=-_f(obs, "p_mw"), gas=-_f(obs, "mass_flow"))
+
+    def max_energy(self):
+        obs = self._obs()
+        return to_multi_energy(
+            power=abs(_f(obs, "p_mw")), gas=abs(_f(obs, "mass_flow"))
+        )
+
+
+class PowerHeatCA(CommonNetworkComponentAccess):
+    def calc_balance(self):
+        obs = self._obs()
+        return to_multi_energy(power=-_f(obs, "p_mw"), heat=-_f(obs, "q_mw_heat"))
+
+    def max_energy(self):
+        obs = self._obs()
+        return to_multi_energy(
+            power=abs(_f(obs, "p_mw")), heat=abs(_f(obs, "q_mw_heat"))
+        )
+
+
+class PowerGasHeatCA(CommonNetworkComponentAccess):
+    def calc_balance(self):
+        obs = self._obs()
+        return to_multi_energy(
+            power=-_f(obs, "p_mw"),
+            heat=-_f(obs, "q_mw_heat"),
+            gas=-_f(obs, "mass_flow"),
+        )
+
+    def max_energy(self):
+        obs = self._obs()
+        return to_multi_energy(
+            power=abs(_f(obs, "p_mw")),
+            heat=abs(_f(obs, "q_mw_heat")),
+            gas=abs(_f(obs, "mass_flow")),
+        )
+
+
+class CouplingPointCA(CommonNetworkComponentAccess):
+    """Balance/capability of a coupling-point branch read from monee branch
+    results.  Branch result dicts expose the per-carrier flows under their
+    ``*_from_mw`` / ``mass_flow`` / ``q_mw_heat`` keys (scaled by ``regulation``)."""
+
+    def _carrier_flows(self):
+        obs = self._obs()
+        reg = _f(obs, "regulation", 1.0)
+        power = _f(obs, "p_from_mw", _f(obs, "p_mw")) * reg
+        gas = _f(obs, "mass_flow") * reg
+        heat = _f(obs, "q_mw_heat") * reg
+        return power, gas, heat
+
+    def calc_balance(self):
+        power, gas, heat = self._carrier_flows()
+        return to_multi_energy(power=-power, heat=-heat, gas=-gas)
+
+    def max_energy(self):
+        power, gas, heat = self._carrier_flows()
+        return to_multi_energy(power=abs(power), heat=abs(heat), gas=abs(gas))
+
+
+# --------------------------------------------------------------------- the agent
+class CellAgentRole(SynapseRole, ABC):
+    """Attraction-based coalition-formation agent.
+
+    Each control round the agent publishes its balance, refreshes its view of the
+    region balance from cached neighbour balances, and asks more-attractive
+    neighbours to merge regions.  The shared :class:`SecmesRegionManager` keeps
+    the coalition state consistent across the single-process simulation.
+    """
+
+    def __init__(self, behavior, common_nc_data_access, is_cp=False, networks=None):
+        super().__init__(behavior)
+        self._ca = common_nc_data_access
+        self._is_cp = is_cp
+        self._networks = networks or []
+        self._peer_balance = {}
         self._operation_point = {}
+        self._round = 0
+        self.last_control_values = {}
 
+    # ----- mango lifecycle
     def setup(self):
         self.context.subscribe_message(
             self, self.handle_join_request, lambda c, _: isinstance(c, JoinRequest)
         )
         self.context.subscribe_message(
             self,
-            self.handle_region_balance_answer,
-            lambda c, _: isinstance(c, RegionBalanceSumAnswer),
+            self.handle_balance_announce,
+            lambda c, _: isinstance(c, AgentBalanceAnnounce),
         )
-        self.context.subscribe_message(
-            self,
-            self.handle_region_balance_request,
-            lambda c, _: isinstance(c, RegionBalanceSumRequest),
-        )
-        self.context.subscribe_message(
-            self,
-            self.handle_agent_balance_answer,
-            lambda c, _: isinstance(c, AgentBalanceSumAnswer),
-        )
-        self.context.subscribe_message(
-            self,
-            self.handle_agent_balance_request,
-            lambda c, _: isinstance(c, AgentBalanceSumRequest),
-        )
-        self.context.subscribe_message(
-            self,
-            self.handle_calc_op,
-            lambda c, _: isinstance(c, CalcOperationPointIteration),
-        )
-
         self.create_initial_region()
+        self.context.schedule_periodic_task(self._control_round, CONTROL_PERIOD_S)
 
+    # ----- region bootstrap
     def create_initial_region(self):
         region_m: SecmesRegionManager = self.region_manager
-        router: SecmesAgentRouter = self.router
-        if (
-            router.exists(self.context.aid)
-            and region_m.get_agent_region(self.context.aid) == None
-        ):
-            if isinstance(self._local_model, CouplingPoint):
-                neighbors = router.calc_cp_neighborhood(
-                    self.context.aid, self._local_model.networks
-                )
-            else:
-                neighbors = router.calc_neighborhood(self.context.aid)
-            neighbor_regions = set(
-                [
-                    region_m.get_agent_region(neighbor)
-                    for neighbor in neighbors
-                    if region_m.get_agent_region(neighbor) is not None
-                ]
-            )
-            region_id = region_m.register_region(neighbor_regions, self.context.aid)
-            return region_id
+        graph: SynapseAgentGraph = self.graph
+        if graph.exists(self.aid) and region_m.get_agent_region(self.aid) is None:
+            neighbors = self._neighbors()
+            neighbor_regions = {
+                region_m.get_agent_region(n)
+                for n in neighbors
+                if region_m.get_agent_region(n) is not None
+            }
+            return region_m.register_region(neighbor_regions, self.aid)
         return None
 
-    def handle_join_request(self, content: JoinRequest, meta):
+    def _neighbors(self):
+        if self._is_cp:
+            return self.graph.calc_cp_neighborhood(self.aid, self._networks)
+        return self.graph.calc_neighborhood(self.aid)
 
-        region_m: SecmesRegionManager = self.region_manager
-        region = region_m.get_agent_region(self.context.aid)
-        if region is not None:
+    # ----- gossip handlers
+    def handle_balance_announce(self, content: AgentBalanceAnnounce, _meta):
+        self._peer_balance[content.sender_aid] = np.array(content.balance)
 
-            region_agents = region_m.get_agents_region(region)
-            calculated_region_balance = self.calc_region_balance(region_agents)
-
-            sender_aid = meta["sender_agent_id"]
-
-            attraction_towards_requesting_region = self.calc_agent_attraction(
-                sender_aid, calculated_region_balance
-            )
-            attraction_towards_current_region = self.calc_agent_attraction(
-                self.context.aid, self._common_nc_data_access.calc_balance()
-            )
-
-            if (
-                attraction_towards_requesting_region
-                >= attraction_towards_current_region
-            ).all():
-                region_m.register_agent(self.context.aid, content.region_id)
-
-    def _get_sender_id(self, meta):
-        return meta["sender_agent_id"]
-
-    def _assign_perception(self, id, key, value):
-        if id not in self._environment_perceptions:
-            self._environment_perceptions[id] = {}
-        self._environment_perceptions[id][key] = value
-
-    def handle_agent_balance_answer(self, content, meta):
-        self._assign_perception(self._get_sender_id(meta), "agent_balance", content.sum)
-
-    def handle_region_balance_answer(self, content, meta):
-        self._assign_perception(
-            self.region_manager.get_agent_region(self._get_sender_id(meta)),
-            "region_balance",
-            content.sum,
-        )
-
-    def handle_region_balance_request(self, _, meta):
-        router: SecmesAgentRouter = self.router
-        region_m: SecmesRegionManager = self.region_manager
-        region = region_m.get_agent_region(self.context.aid)
-
-        # Request can happen before control initialization
+    def handle_join_request(self, content: JoinRequest, _meta):
+        region_m = self.region_manager
+        region = region_m.get_agent_region(self.aid)
         if region is None:
-            region = self.create_initial_region()
-
-        region_agents = region_m.get_agents_region(region)
-        router.dispatch_message_sync(
-            RegionBalanceSumAnswer(self.calc_region_balance(region_agents)),
-            self._get_sender_id(meta),
-            self.context.aid,
+            return
+        own_region_balance = self.calc_region_balance(region_m.get_agents_region(region))
+        attraction_to_requester = self.calc_agent_attraction(
+            content.sender_aid, own_region_balance
         )
+        attraction_to_own = self.calc_agent_attraction(self.aid, self._ca.calc_balance())
+        if (attraction_to_requester >= attraction_to_own).all():
+            region_m.register_agent(self.aid, content.region_id)
 
-    def handle_agent_balance_request(self, _, meta):
-        router: SecmesAgentRouter = self.router
-        router.dispatch_message_sync(
-            AgentBalanceSumAnswer(self._common_nc_data_access.calc_balance()),
-            self._get_sender_id(meta),
-            self.context.aid,
-        )
-
-    def get_or_request_agent_balance(self, agent_id):
-        if agent_id == self.context.aid:
-            return self._common_nc_data_access.calc_balance()
-        router: SecmesAgentRouter = self.router
-        router.dispatch_message_sync(
-            AgentBalanceSumRequest(), agent_id, self.context.aid
-        )
-        return self._environment_perceptions[agent_id]["agent_balance"]
-
-    def get_or_request_region_balance(self, agent_id):
-        region_m: SecmesRegionManager = self.region_manager
-        router: SecmesAgentRouter = self.router
-        region = region_m.get_agent_region(agent_id)
-
-        # Request can happen before control initialization
-        if region is None:
-            return self.get_or_request_agent_balance(agent_id)
-
-        if agent_id == self.context.aid:
-            return self.calc_region_balance(region_m.get_agents_region(region))
-
-        router.dispatch_message_sync(
-            RegionBalanceSumRequest(), agent_id, self.context.aid
-        )
-        return self._environment_perceptions[region]["region_balance"]
+    # ----- balances / attraction
+    def _balance_of(self, agent_id):
+        if agent_id == self.aid:
+            return self._ca.calc_balance()
+        return self._peer_balance.get(agent_id, to_multi_energy())
 
     def calc_region_balance(self, region_agents):
-        sum = 0
-        for region_agent in region_agents:
-            if region_agent == self.context.aid:
-                sum += self._common_nc_data_access.calc_balance()
-            else:
-                sum += self.get_or_request_agent_balance(region_agent)
-        return sum
+        total = to_multi_energy()
+        for agent in region_agents:
+            total = total + self._balance_of(agent)
+        return total
 
     def calc_agent_attraction(self, other, calculated_balance):
-        other_balance = self.get_or_request_region_balance(other)
-        return -np.sign(calculated_balance) * other_balance - self.calc_cost_gradient(
-            other
-        )
+        region = self.region_manager.get_agent_region(other)
+        if region is None:
+            other_balance = self._balance_of(other)
+        else:
+            other_balance = self.calc_region_balance(
+                self.region_manager.get_agents_region(region)
+            )
+        return -np.sign(calculated_balance) * other_balance - self.calc_cost_gradient(other)
 
-    def project(self, x, r):
-        # cons_x = self._common_nc_data_access.define_local_constraints()(x/(r/10 + 1))
-        # return np.clip(x if cons_x is None else cons_x, 0, 1)
-        # return x if cons_x is None else cons_x
-        return x
+    def calc_cost_gradient(self, neighbor):
+        return to_multi_energy()
 
-    def handle_calc_op(self, content: CalcOperationPointIteration, _):
-        r = self._local_model.regulation_factor()
-        time = content.time
-        w = content.w
-        x = content.x
-        region_agents = self.region_manager.get_agents_region(
-            self.region_manager.get_agent_region(self.context.aid)
-        )
-        i = region_agents.index(self.context.aid)
-        # f = lambda x: self._common_nc_data_access.max_energy() * x
-        new_x = iteration_step(
-            w,
-            x,
-            lambda x: self._common_nc_data_access.max_energy(),
-            len(region_agents),
-            i,
-            time,
-        )
-        x[i] = self.project(new_x, r)
-        self._operation_point[time] = x[i]
-
+    # ----- operation point (local distributed gradient step)
     def calculate_operation_point(self, time):
         if time in self._operation_point:
             return self._operation_point[time]
-        router: SecmesAgentRouter = self.router
-        region_agents = self.region_manager.get_agents_region(
-            self.region_manager.get_agent_region(self.context.aid)
-        )
-        r = self._local_model.regulation_factor()
+        region = self.region_manager.get_agent_region(self.aid)
+        if region is None:
+            return np.ones(3)
+        region_agents = list(self.region_manager.get_agents_region(region))
         m = len(region_agents)
-        x = np.array([np.ones(3) for i in range(m)])
-        # f = lambda x: self._common_nc_data_access.max_energy() * x
-        i = region_agents.index(self.context.aid)
-        alpha = generate_linear_desc_array(100)
+        i = region_agents.index(self.aid) if self.aid in region_agents else 0
+        x = np.array([np.ones(3) for _ in range(m)])
         w = generate_random_doubly_stoch_mat((m, m))
-
-        for j in range(100):
+        for j in range(20):
             new_x = iteration_step(
-                w, x, lambda x: self._common_nc_data_access.max_energy(), m, i, j
+                w, x, lambda _x: self._ca.max_energy(), m, i, j
             )
-            for region_agent in region_agents:
-                router.dispatch_message_sync(
-                    CalcOperationPointIteration(time, w, alpha, x),
-                    region_agent,
-                    self.context.aid,
-                )
-            x[i] = self.project(new_x, r)
-
+            x[i] = new_x
         self._operation_point[time] = x[i]
         return x[i]
 
     def execute_operation_point(self, time):
-        if isinstance(self._local_model, RegulatableMESModel):
-            operation_point = self.calculate_operation_point(time)
-            # todo op aggregation
-            self._local_model.regulate(operation_point[0])
+        op = self.calculate_operation_point(time)
+        factor = float(np.clip(op[0], 0.0, 1.0))
+        if self.behavior.has_action(self.aid, "regulate"):
+            self.behavior.act(self.aid, "regulate", factor)
 
-    def calc_cost_gradient(self, neighbor):
-        return [0, 0, 0]
+    # ----- per-round control
+    async def _control_round(self):
+        time = self._round
+        self._round += 1
 
-    # Resistance = 0.021 / 0.095
-    # 1/(alpha*d*pi*l)
-
-    def control(self, time):
-        region_m: SecmesRegionManager = self.region_manager
-        router: SecmesAgentRouter = self.router
-        agent_control_values = {}
-        aid = self.context.aid
-        region = region_m.get_agent_region(aid)
+        region_m = self.region_manager
+        region = region_m.get_agent_region(self.aid)
         if region is None:
             region = self.create_initial_region()
+        if region is None:
+            return
 
-        if region is not None:
-            region_agents = region_m.get_agents_region(region)
-            calculated_region_balance = self.calc_region_balance(region_agents)
-            agent_control_values["region_balance_power"] = calculated_region_balance[0]
-            agent_control_values["region_balance_heat"] = calculated_region_balance[1]
-            agent_control_values["region_balance_gas"] = calculated_region_balance[2]
+        own_balance = self._ca.calc_balance()
+        neighbors = self._neighbors()
 
-            agent_control_values["attraction_power"] = []
-            agent_control_values["attraction_heat"] = []
-            agent_control_values["attraction_gas"] = []
-            if isinstance(self._local_model, CouplingPoint):
-                neighbors = router.calc_cp_neighborhood(
-                    self.context.aid, self._local_model.networks
+        # Publish our balance to neighbors so they can refresh their view.
+        for neighbor in neighbors:
+            await self.send(neighbor, AgentBalanceAnnounce(self.aid, own_balance.tolist()))
+
+        region_agents = region_m.get_agents_region(region)
+        region_balance = self.calc_region_balance(region_agents)
+
+        control_values = {
+            "region_balance_power": float(region_balance[0]),
+            "region_balance_heat": float(region_balance[1]),
+            "region_balance_gas": float(region_balance[2]),
+        }
+
+        for neighbor in neighbors:
+            attraction = self.calc_agent_attraction(neighbor, region_balance)
+            if neighbor in region_agents:
+                continue
+            if (attraction >= 0).all():
+                await self.send(
+                    neighbor, JoinRequest(self.aid, region, attraction.tolist())
                 )
-            else:
-                neighbors = router.calc_neighborhood(self.context.aid)
-            for neighbor in neighbors:
-                attraction = self.calc_agent_attraction(
-                    neighbor, calculated_region_balance
-                )
-                agent_control_values["attraction_power"].append(
-                    (neighbor, attraction[0])
-                )
-                agent_control_values["attraction_heat"].append(
-                    (neighbor, attraction[1])
-                )
-                agent_control_values["attraction_gas"].append((neighbor, attraction[2]))
-                if neighbor in region_agents:
-                    continue
-                if (attraction >= 0).all():
-                    router.dispatch_message_sync(
-                        JoinRequest(region, attraction), neighbor, aid
-                    )
 
-            self.execute_operation_point(time)
+        self.execute_operation_point(time)
 
-        agent_control_values["region"] = (
-            -1
-            if region_m.get_agent_region(aid) is None
-            else region_m.get_agent_region(aid)
-        )
-        return agent_control_values
-
-
-def to_multi_energy(power=0, heat=0, gas=0):
-    if (
-        not isinstance(power, (float, int))
-        or not isinstance(heat, (float, int))
-        or not isinstance(gas, (float, int))
-    ):
-        raise Exception(f"Input values are suspicious! {power}.{heat}.{gas}")
-    return np.array([power, heat, gas])
-
-
-VM_PU_REF = 1
-P_BAR_REF = 60
-TEMP_K_REF = 375
-
-
-def power_constraint(bus_data, r):
-    if np.abs(VM_PU_REF - bus_data["power"][0]["vm_pu"]) * (r[0] / 10 + 1) <= 0.1:
-        if bus_data["power"][0]["vm_pu"] > VM_PU_REF:
-            return 1.1 / bus_data["power"][0]["vm_pu"]
-        else:
-            return 0.9 / bus_data["power"][0]["vm_pu"]
-
-
-def heat_constraint(junc_data, r):
-    if (
-        TEMP_K_REF * 0.9
-        <= junc_data["heat"][1]["t_k"] * (r[1] / 10 + 1)
-        <= TEMP_K_REF * 1.1
-    ):
-        if junc_data["heat"][0]["t_k"] > TEMP_K_REF:
-            return 1.1 / junc_data["heat"][0]["t_k"]
-        else:
-            return 0.9 / junc_data["heat"][0]["t_k"]
-
-
-def gas_constraint(junc_data, r):
-    if (
-        P_BAR_REF * 0.9
-        <= junc_data["gas"][0]["p_bar"] * (r[2] / 10 + 1)
-        <= P_BAR_REF * 1.1
-    ):
-        if junc_data["gas"][0]["p_bar"] > P_BAR_REF:
-            return 1.1 / junc_data["gas"][0]["p_bar"]
-        else:
-            return 0.9 / junc_data["gas"][0]["p_bar"]
-
-
-class CommonNetworkComponentAccess(ABC):
-    def __init__(self, local_model) -> None:
-        super().__init__()
-
-        self._local_model = local_model
-
-    @abstractmethod
-    def calc_balance(self):
-        pass
-
-    @abstractmethod
-    def max_energy(self):
-        pass
-
-    @abstractmethod
-    def define_local_constraints(self):
-        pass
-
-
-INVERT_CA_POWER = {PowerLoadNode, P2GNode, P2HNode}
-INVERT_CA_GAS_FLOW = {CHPNode, G2PNode, SinkNode}
-
-
-def calc_power_balance(local_model):
-    if type(local_model) in INVERT_CA_POWER:
-        return -local_model.active_power()
-    return local_model.active_power()
-
-
-def calc_gas_balance(local_model):
-    if type(local_model) in INVERT_CA_GAS_FLOW:
-        return -local_model.mdot_kg_per_s()
-    return local_model.mdot_kg_per_s()
-
-
-class PowerCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy(self._local_model.active_power_capability())
-
-    def define_local_constraints(self):
-        return lambda r: power_constraint(
-            pn.get_bus_junc_res_data(self._local_model), r
-        )
-
-    def calc_balance(self):
-        model = self._local_model
-        return to_multi_energy(power=calc_power_balance(model))
-
-
-class GasCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy(gas=self._local_model.mdot_kg_per_s_capability())
-
-    def define_local_constraints(self):
-        return lambda r: gas_constraint(pn.get_bus_junc_res_data(self._local_model), r)
-
-    def calc_balance(self):
-        return to_multi_energy(gas=calc_gas_balance(self._local_model))
-
-
-class DummyHeatCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy()
-
-    def define_local_constraints(self):
-        return lambda _: 0
-
-    def calc_balance(self):
-        return to_multi_energy(heat=0)
-
-
-class HeatCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy(self._local_model.q_capability())
-
-    def define_local_constraints(self):
-        return lambda r: heat_constraint(pn.get_bus_junc_res_data(self._local_model), r)
-
-    def calc_balance(self):
-        return to_multi_energy(heat=self._local_model.qext_w())
-
-
-class PowerGasCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy(
-            power=self._local_model.active_power_capability(),
-            gas=self._local_model.mdot_kg_per_s_capability(),
-        )
-
-    def define_local_constraints(self):
-        data = pn.get_bus_junc_res_data(self._local_model)
-        return lambda r: gas_constraint(data, r) and power_constraint(data, r)
-
-    def calc_balance(self):
-
-        return to_multi_energy(
-            power=calc_power_balance(self._local_model),
-            gas=calc_gas_balance(self._local_model),
-        )
-
-
-class PowerGasHeatCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy(
-            power=self._local_model.active_power_capability(),
-            gas=self._local_model.mdot_kg_per_s_capability(),
-            heat=self._local_model.q_capability(),
-        )
-
-    def define_local_constraints(self):
-        data = pn.get_bus_junc_res_data(self._local_model)
-        return (
-            lambda r: gas_constraint(data, r)
-            and power_constraint(data, r)
-            and heat_constraint(data, r)
-        )
-
-    def calc_balance(self):
-        return to_multi_energy(
-            power=calc_power_balance(self._local_model),
-            heat=self._local_model.qext_w(),
-            gas=calc_gas_balance(self._local_model),
-        )
-
-
-class PowerHeatCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy(
-            power=self._local_model.active_power_capability(),
-            heat=self._local_model.q_capability(),
-        )
-
-    def define_local_constraints(self):
-        data = pn.get_bus_junc_res_data(self._local_model)
-        return lambda r: power_constraint(data, r) and heat_constraint(data, r)
-
-    def calc_balance(self):
-        return to_multi_energy(
-            power=calc_power_balance(self._local_model),
-            heat=self._local_model.qext_w(),
-        )
+        current_region = region_m.get_agent_region(self.aid)
+        control_values["region"] = -1 if current_region is None else current_region
+        self.last_control_values = control_values
+        return control_values

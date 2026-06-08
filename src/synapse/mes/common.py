@@ -1,53 +1,33 @@
-from peext.node import RegulatableController
+"""Small evaluation / messaging helpers, monee-based.
 
-from pandapipes.properties.fluids import get_fluid
+The former pandapipes/peext couplings are gone: edge state is now read from
+monee branch result models (plain ``model.values`` dicts) and the gas energy
+conversion uses monee's lgas HHV constant.
+"""
+
+# Default lgas HHV (matches monee.network.mes): 15.3 kWh/kg * 3.6 MJ/kWh.
+GAS_HHV_MJ_PER_KG = 15.3 * 3.6
 
 
 class EdgeCollector:
-    """Collector for edge data regarding a specific controller node"""
+    """Collect the boundary physical quantity (voltage / pressure / temperature)
+    a coupling point sees on each of the grids it connects.
 
-    def __init__(self, time_delta=0):
-        self.__time_delta = time_delta
+    ``branch_values_by_grid`` maps a grid key (``"power"`` / ``"gas"`` / ``"heat"``)
+    to the monee branch ``model.values`` dict adjacent to the coupling point.
+    """
 
-    def collect(self, controller: RegulatableController):
-        """Collect edge data for the controller
-
-        :param controller: the controller
-        :type controller: RegulatableController
-        :return: dictionary containing the relevant edge data
-        :rtype: Dict
-        """
+    def collect(self, branch_values_by_grid):
         value_dict = {}
-        if "power" in controller.edges:
-            edges_power = controller.edges["power"][0]
-            if edges_power[1] == "to":
-                value_dict["voltage"] = edges_power[0].voltage_magnitude_end(
-                    time_delta=self.__time_delta
-                )
-            else:
-                value_dict["voltage"] = edges_power[0].voltage_magnitude_start(
-                    time_delta=self.__time_delta
-                )
-        if "gas" in controller.edges:
-            edges_gas = controller.edges["gas"][0]
-            if edges_gas[1] == "to":
-                value_dict["pressure"] = edges_gas[0].pressure_end(
-                    time_delta=self.__time_delta
-                )
-            else:
-                value_dict["pressure"] = edges_gas[0].pressure_start(
-                    time_delta=self.__time_delta
-                )
-        if "heat" in controller.edges:
-            edges_heat = controller.edges["heat"][0]
-            if edges_heat[1] == "to":
-                value_dict["temp"] = edges_heat[0].temp_end(
-                    time_delta=self.__time_delta
-                )
-            else:
-                value_dict["temp"] = edges_heat[0].temp_start(
-                    time_delta=self.__time_delta
-                )
+        power = branch_values_by_grid.get("power")
+        if power is not None:
+            value_dict["voltage"] = power.get("vm_pu")
+        gas = branch_values_by_grid.get("gas")
+        if gas is not None:
+            value_dict["pressure"] = gas.get("pressure_pu", gas.get("p_pu"))
+        heat = branch_values_by_grid.get("heat")
+        if heat is not None:
+            value_dict["temp"] = heat.get("t_k")
         return value_dict
 
 
@@ -73,6 +53,6 @@ class NodeConfigurationMessage:
         return self._configuration
 
 
-def conversion_factor_kgps_to_mw(net):
-    fcv = get_fluid(net).get_property("hhv")
-    return fcv * 3600 / 1e3
+def conversion_factor_kgps_to_mw():
+    """kg/s -> MW for lgas via the higher heating value."""
+    return GAS_HHV_MJ_PER_KG
