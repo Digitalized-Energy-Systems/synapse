@@ -32,6 +32,12 @@ from monee.network.mes import (
 
 DEFAULT_COUPLINGS = ("chp", "p2g", "p2h")
 
+# monee's gas/heat tree builders derive pipe length from the geographic distance
+# between the two buses; simbench grids contain co-located buses (distance 0),
+# which yields a zero-length pipe that divides by zero in the Weymouth/thermal
+# equations.  Clamp such pipes to a tiny positive length before solving.
+MIN_PIPE_LENGTH_M = 1.0
+
 
 def _default_distribution(metric, all_values):
     """Default centrality -> placement-probability weight.
@@ -165,9 +171,23 @@ def create_coupling_points_distributed(
     return created
 
 
+def _clamp_zero_length_pipes(mes_net, min_length_m=MIN_PIPE_LENGTH_M):
+    """Raise any zero-length pipe to ``min_length_m`` so the gas/heat equations
+    don't divide by zero.  Returns the number of pipes adjusted."""
+    clamped = 0
+    for branch in mes_net.branches:
+        model = branch.model
+        length = getattr(model, "length_m", None)
+        if length is not None and float(length) <= 0.0:
+            model.length_m = min_length_m
+            clamped += 1
+    return clamped
+
+
 def prepare_for_solve(mes_net):
     """Make ``mes_net`` solve-ready at scale: apply the MISOCP formulation and the
     storage extensions, matching scare's gurobi recipe."""
+    _clamp_zero_length_pipes(mes_net)
     mes_net.apply_formulation(MISOCP_NETWORK_FORMULATION)
     mes_net.add_extension(GasLinepack())
     mes_net.add_extension(LumpedThermalCapacitance(first_step_steady_state=True))

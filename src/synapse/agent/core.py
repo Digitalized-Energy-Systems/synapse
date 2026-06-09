@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import itertools
 from typing import List, Set
 
 import networkx as nx
@@ -188,24 +187,37 @@ class SynapseAgentGraph:
         return self.calc_neighborhood(cp_id, cutoff_length=cutoff_length)
 
     def lookup_direct_neighbors(self, agent_id, include_virtual_nodes=False, blacklist=None):
-        if blacklist is None:
-            blacklist = []
         if agent_id not in self._agent_topology.nodes:
             return set()
+        block = set(blacklist) if blacklist else set()
         direct = {
-            n for n in nx.neighbors(self._agent_topology, agent_id) if n not in blacklist
+            n for n in nx.neighbors(self._agent_topology, agent_id) if n not in block
         }
-        virtual = {n for n in direct if is_virtual_node(n)}
         if include_virtual_nodes:
             return direct
-        return (direct - virtual) | set(
-            itertools.chain.from_iterable(
-                self.lookup_direct_neighbors(
-                    vn, include_virtual_nodes=False, blacklist=blacklist + [vn]
-                )
-                for vn in virtual
-            )
-        )
+
+        # Real-agent neighbours are reached by hopping through the *virtual*
+        # connector nodes (``node-<id>``), which form a densely interconnected
+        # mesh.  Expand each virtual node at most once via a shared visited set;
+        # the previous per-branch blacklist (passed by value) re-expanded shared
+        # virtual nodes through exponentially many paths and never terminated on
+        # real grids (only the CONNECTED_COMPONENTS splitting path hit this).
+        virtual = {n for n in direct if is_virtual_node(n)}
+        result = direct - virtual
+        expanded = set(block)
+        expanded.update(virtual)
+        frontier = list(virtual)
+        while frontier:
+            vn = frontier.pop()
+            for n in nx.neighbors(self._agent_topology, vn):
+                if n in expanded:
+                    continue
+                if is_virtual_node(n):
+                    expanded.add(n)
+                    frontier.append(n)
+                else:
+                    result.add(n)
+        return result
 
     def get_agents_as_subgraph(self, agent_ids: List[str]):
         return self._agent_topology.subgraph(agent_ids)
