@@ -189,8 +189,6 @@ def prepare_for_solve(mes_net):
     storage extensions, matching scare's gurobi recipe."""
     _clamp_zero_length_pipes(mes_net)
     mes_net.apply_formulation(MISOCP_NETWORK_FORMULATION)
-    mes_net.add_extension(GasLinepack())
-    mes_net.add_extension(LumpedThermalCapacitance(first_step_steady_state=True))
     return mes_net
 
 
